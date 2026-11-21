@@ -76,6 +76,12 @@ image_urls = [
 ]
 
 
+def _sanitized_base_name(raw_title: str, fallback: str = "video_output") -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|]+', " ", (raw_title or "")).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)[:60].strip()
+    return cleaned or fallback
+
+
 def _find_downloaded_file(base_name: str):
     if not base_name:
         return None
@@ -92,26 +98,56 @@ def _find_downloaded_file(base_name: str):
     return None
 
 
+def _build_adda_test_url(url: str, pkg_id: str = "100653", is_olc: str = "true") -> str:
+    if "videotest.adda247.com/file" in url:
+        return url
+    if "video-streaming-source.s3.ap-south-1.amazonaws.com" in url:
+        encoded_vp = urllib.parse.quote(url, safe="")
+        return f"https://videotest.adda247.com/file?vp={encoded_vp}&pkgId={pkg_id}&isOlc={is_olc}"
+    return url
+
+
+def _resolve_adda_stream_url(url: str) -> str:
+    target_url = _build_adda_test_url(url)
+    adda_headers = {
+        "Authorization": f"Bearer {adda_token}",
+        "token": adda_token,
+        "Referer": "https://www.adda247.com/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36",
+    }
+    try:
+        resp = requests.get(target_url, headers=adda_headers, allow_redirects=True, timeout=20)
+        if resp.url and resp.url != target_url:
+            return resp.url
+    except Exception:
+        pass
+    return target_url
+
+
 async def _safe_download_video(url: str, cmd: str, name: str):
+    safe_base = _sanitized_base_name(name)
     if "adda247" in url or "video-streaming-source" in url or "s3.ap-south-1.amazonaws.com" in url:
+        resolved_url = _resolve_adda_stream_url(url)
         adda_cmd = (
             f'yt-dlp --no-check-certificate '
             f'--add-header "Authorization: Bearer {adda_token}" '
             f'--add-header "token: {adda_token}" '
             f'--add-header "Referer: https://www.adda247.com/" '
             f'--add-header "User-Agent: Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36" '
-            f'-f "best[ext=mp4]/best" "{url}" -o "{name}.mp4"'
+            f'-f "best[ext=mp4]/best" "{resolved_url}" -o "{safe_base}.mp4"'
         )
-        subprocess.run(f"{adda_cmd} -R 15 --fragment-retries 15", shell=True)
-        found = _find_downloaded_file(name)
+        proc = subprocess.run(f"{adda_cmd} -R 10 --fragment-retries 10", shell=True, capture_output=True, text=True)
+        found = _find_downloaded_file(safe_base)
         if not found:
-            raise FileNotFoundError(f"Adda/S3 video file not created for: {name}")
+            err_lines = [line.strip() for line in (proc.stderr or proc.stdout or "").splitlines() if line.strip()]
+            err_tail = " | ".join(err_lines[-3:]) if err_lines else "No output file created"
+            raise FileNotFoundError(f"Adda/S3 download failed for '{safe_base}': {err_tail}")
         return found
 
-    res_file = await helper.download_video(url, cmd, name)
-    found = _find_downloaded_file(res_file) if res_file else _find_downloaded_file(name)
+    res_file = await helper.download_video(url, cmd, safe_base)
+    found = _find_downloaded_file(res_file) if res_file else _find_downloaded_file(safe_base)
     if not found:
-        raise FileNotFoundError(f"Downloaded video file not found for: {name}")
+        raise FileNotFoundError(f"Downloaded video file not found for: {safe_base}")
     return found
 
 
@@ -611,7 +647,7 @@ async def txt_handler(bot: Client, m: Message):
             url = "https://" + Vxy
             link0 = "https://" + Vxy
             name1 = links[i][0].replace("(", "[").replace(")", "]").replace("_", "").replace("\t", "").replace(":", "").replace("/", "").replace("+", "").replace("#", "").replace("|", "").replace("@", "").replace("*", "").replace(".", "").replace("https", "").replace("http", "").strip()
-            name = f'{name1[:60]}'
+            name = _sanitized_base_name(name1, fallback=f"item_{str(count).zfill(3)}")
 
             if "visionias" in url:
                 async with ClientSession() as session:
@@ -840,7 +876,7 @@ async def txt_handler(bot: Client, m: Message):
     await m.reply_text(f"⋅ ─ list index ({raw_text}-{len(links)}) out of range ─ ⋅\n\n<blockquote><b>✨BATCH</b> » {b_name}✨</blockquote>\n\n⋅ ─ DOWNLOADING ✩ COMPLETED ─ ⋅")
 
 
-@bot.on_message(filters.text & filters.private)
+@bot.on_message(filters.text & filters.private & ~filters.command([]))
 async def text_handler(bot: Client, m: Message):
     if m.from_user.is_bot:
         return
@@ -877,7 +913,7 @@ async def text_handler(bot: Client, m: Message):
     try:
         url = link.replace("file/d/", "uc?export=download&id=").replace("www.youtube-nocookie.com/embed", "youtu.be").replace("?modestbranding=1", "").replace("/view?usp=sharing", "")
         name1 = links.replace("(", "[").replace(")", "]").replace("_", "").replace("\t", "").replace(":", "").replace("/", "").replace("+", "").replace("#", "").replace("|", "").replace("@", "").replace("*", "").replace(".", "").replace("https", "").replace("http", "").strip()
-        name = f'{name1[:60]}'
+        name = _sanitized_base_name(name1, fallback="single_video")
 
         if "visionias" in url:
             async with ClientSession() as session:
